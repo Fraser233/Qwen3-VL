@@ -1,9 +1,54 @@
 import os
+import re
+import ast
 import torch
 import string
 import pandas as pd
 from typing import Dict, Any, List
-from datasets import load_dataset
+
+
+def _parse_options(raw_options):
+    if isinstance(raw_options, list):
+        return [str(x).strip() for x in raw_options]
+
+    text = str(raw_options)
+    if not text.strip():
+        return []
+
+    # Standard Python-list string
+    try:
+        parsed = ast.literal_eval(text)
+        if isinstance(parsed, (list, tuple)):
+            return [str(x).strip() for x in parsed]
+    except Exception:
+        pass
+
+    # Numpy-style array string: ['A...' 'B...' ...]
+    quoted = re.findall(r"'([^']*)'", text)
+    if quoted:
+        return [q.strip() for q in quoted]
+
+    # Fallback: newline split
+    return [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+
+def _load_videomme_from_tsv(tsv_path: str, duration: str) -> List[Dict[str, Any]]:
+    df = pd.read_csv(tsv_path, sep='\t')
+    rows: List[Dict[str, Any]] = []
+    for _, row in df.iterrows():
+        item = row.to_dict()
+        if str(item.get('duration', '')).strip() != duration:
+            continue
+
+        item['videoID'] = str(item.get('videoID', item.get('video_id', ''))).strip()
+        item['question_id'] = str(item.get('question_id', '')).strip()
+        item['question'] = str(item.get('question', '')).strip()
+        item['domain'] = str(item.get('domain', '')).strip()
+        item['sub_category'] = str(item.get('sub_category', '')).strip()
+        item['answer'] = str(item.get('answer', '')).strip()
+        item['options'] = _parse_options(item.get('options', ''))
+        rows.append(item)
+    return rows
 
 def load_videomme_dataset(data_dir, duration='short'):
     """
@@ -18,10 +63,34 @@ def load_videomme_dataset(data_dir, duration='short'):
     """
     print(f"Loading VideoMME dataset with duration={duration}")
     
-    total_data = []
-    for item in load_dataset(data_dir)["test"]:
-        if item['duration'] == duration:
-            total_data.append(item)
+    data_dir_raw = str(data_dir).strip()
+    if not data_dir_raw:
+        raise ValueError(
+            "VideoMME data_dir is empty. Pass --data-dir explicitly "
+            "(e.g. /media/chenxi/ISC/VIVID/VideoMME)."
+        )
+
+    data_dir = os.path.abspath(data_dir_raw)
+    if os.path.basename(data_dir).lower() == 'videos':
+        data_dir = os.path.dirname(data_dir)
+
+    if not os.path.isdir(data_dir):
+        raise ValueError(
+            f"VideoMME data directory does not exist: {data_dir}. "
+            "Pass --data-dir explicitly to a valid local dataset directory."
+        )
+
+    tsv_candidates = [
+        os.path.join(data_dir, "VideoMME.tsv"),
+        os.path.join(str(os.environ.get("LMUData", "")).strip(), "VideoMME.tsv"),
+        "/media/chenxi/ISC/VIVID/LMUData/VideoMME.tsv",
+    ]
+    tsv_path = next((p for p in tsv_candidates if p and os.path.exists(p)), "")
+    if not tsv_path:
+        raise FileNotFoundError(
+            f"No local VideoMME.tsv found. Tried: {tsv_candidates}"
+        )
+    total_data = _load_videomme_from_tsv(tsv_path, duration)
     
     print(f"✓ Loaded {len(total_data)} samples with duration={duration}")
     return total_data

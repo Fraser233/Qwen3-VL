@@ -97,10 +97,22 @@ def generate_odinw_jobs(data_dir: str, args) -> Tuple[List[Dict], Dict]:
     Returns:
         (question_list, datasets): Task list and dataset configurations
     """
+    # Normalize data root
+    data_dir_raw = str(data_dir).strip()
+    if not data_dir_raw:
+        raise FileNotFoundError(
+            "ODinW data_dir is empty. Pass --data-dir explicitly "
+            "(e.g. /media/chenxi/ISC/VIVID/ODinW-13)."
+        )
+    data_dir = os.path.abspath(data_dir_raw)
+
     # Load config
     config_path = os.path.join(data_dir, "odinw13_config.py")
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+        raise FileNotFoundError(
+            f"Config file not found: {config_path}. "
+            f"Provided data_dir: {data_dir}"
+        )
     
     datasets = load_odinw_config(config_path)
     

@@ -17,6 +17,8 @@ MATHVISION_DATASET_MD5 = {
 
 def load_dataset(dataset_name='MathVision'):
     """Load the MathVision dataset."""
+    if 'LMUData' not in os.environ:
+        raise ValueError("LMUData is not set. Pass --data-dir to run_mathv.py")
     data_root = os.path.join(os.environ['LMUData'])
     os.makedirs(data_root, exist_ok=True)
     

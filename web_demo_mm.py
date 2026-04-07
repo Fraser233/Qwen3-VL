@@ -7,10 +7,21 @@ import copy
 import re
 from argparse import ArgumentParser
 from threading import Thread
+from pathlib import Path
 
 import gradio as gr
 import torch
 from transformers import AutoProcessor, AutoModelForImageTextToText, TextIteratorStreamer
+
+import sys
+qwen_root = Path(__file__).resolve().parent
+if str(qwen_root) not in sys.path:
+    sys.path.insert(0, str(qwen_root))
+from vivid.qwen3_patch import (
+    apply_vivid_qwen3_vision_patch,
+    count_vivid_qwen3_blocks,
+    is_vivid_qwen3_vision_patched,
+)
 
 try:
     from vllm import SamplingParams, LLM
@@ -85,6 +96,9 @@ def _load_model_processor(args):
 
         # Load processor for vLLM
         processor = AutoProcessor.from_pretrained(args.checkpoint_path)
+        if hasattr(model, "llm_engine"):
+            # vLLM backend does not expose a mutable HF vision module in-process.
+            print("Info: VIVID patch is skipped for vLLM backend.")
         return model, processor, 'vllm'
     else:
         if args.cpu_only:
@@ -100,6 +114,27 @@ def _load_model_processor(args):
                                                                     device_map=device_map)
         else:
             model = AutoModelForImageTextToText.from_pretrained(args.checkpoint_path, device_map=device_map)
+
+        vivid_enabled = os.environ.get("QWEN3_VIVID_ENABLED", "1") != "0"
+        vivid_anchors = int(os.environ.get("QWEN3_VIVID_ANCHORS", "256"))
+        vivid_topk = int(os.environ.get("QWEN3_VIVID_TOPK", "8"))
+        patched = apply_vivid_qwen3_vision_patch(
+            model,
+            num_anchors=vivid_anchors,
+            topk=vivid_topk,
+            enabled=vivid_enabled,
+        )
+        vivid_blocks = count_vivid_qwen3_blocks(model)
+        strict = os.environ.get("QWEN3_VIVID_STRICT", "1") != "0"
+        if vivid_enabled and strict and not is_vivid_qwen3_vision_patched(model):
+            raise RuntimeError(
+                "VIVID patch requested but not applied: no Qwen3 vision block uses Qwen3VIVIDVisionAttention."
+            )
+
+        if patched > 0 or vivid_blocks > 0:
+            print(
+                f"VIVID Qwen3 vision status: patched_now={patched}, vivid_blocks={vivid_blocks}, anchors={vivid_anchors}, topk={vivid_topk}, enabled={vivid_enabled}"
+            )
 
         processor = AutoProcessor.from_pretrained(args.checkpoint_path)
         return model, processor, 'hf'

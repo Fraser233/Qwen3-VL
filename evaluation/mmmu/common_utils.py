@@ -1,6 +1,7 @@
 import os
 import requests
 import base64
+import binascii
 import hashlib
 import io
 from PIL import Image
@@ -25,7 +26,35 @@ def encode_image_to_base64(image, target_size=None):
 
 def decode_base64_to_image(base64_string):
     """Decode a base64 string to an image."""
-    image_data = base64.b64decode(base64_string)
+    if isinstance(base64_string, bytes):
+        s = base64_string.decode("utf-8", errors="ignore")
+    else:
+        s = str(base64_string)
+
+    s = s.strip()
+    if "," in s and "base64" in s[:80].lower():
+        s = s.split(",", 1)[1]
+
+    s = "".join(s.split())
+    if len(s) == 0:
+        raise ValueError("Empty base64 image string")
+
+    pad = (-len(s)) % 4
+    if pad:
+        s = s + ("=" * pad)
+
+    image_data = None
+    last_err = None
+    for decoder in (base64.b64decode, base64.urlsafe_b64decode):
+        try:
+            image_data = decoder(s)
+            break
+        except (binascii.Error, ValueError) as e:
+            last_err = e
+
+    if image_data is None:
+        raise ValueError(f"Invalid base64 image payload: {last_err}")
+
     return Image.open(io.BytesIO(image_data))
 
 def decode_base64_to_image_file(base64_string, output_path):

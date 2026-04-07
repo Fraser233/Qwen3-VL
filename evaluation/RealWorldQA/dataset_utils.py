@@ -27,8 +27,11 @@ def load_dataset(dataset_name='RealWorldQA'):
         pd.DataFrame: Loaded dataset
     """
     if 'LMUData' not in os.environ:
-        raise ValueError("Please set LMUData environment variable or use --data-dir argument")
-    data_root = os.path.join(os.environ['LMUData'])
+        raise ValueError("LMUData is not set. Pass --data-dir to run_realworldqa.py")
+    data_root = str(os.environ['LMUData']).strip()
+    if not data_root:
+        raise ValueError("LMUData is empty. Pass a non-empty --data-dir to run_realworldqa.py")
+    data_root = os.path.abspath(data_root)
     os.makedirs(data_root, exist_ok=True)
     
     file_name = f"{dataset_name}.tsv"

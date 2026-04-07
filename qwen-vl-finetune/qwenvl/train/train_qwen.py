@@ -25,7 +25,17 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
+# Ensure Qwen3-VL root is importable for VIVID helpers.
+qwen_root = Path(__file__).resolve().parents[3]
+if str(qwen_root) not in sys.path:
+    sys.path.insert(0, str(qwen_root))
+
 from trainer import replace_qwen2_vl_attention_class
+from vivid.qwen3_patch import (
+    apply_vivid_qwen3_vision_patch,
+    count_vivid_qwen3_blocks,
+    is_vivid_qwen3_vision_patched,
+)
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -134,6 +144,29 @@ def train(attn_implementation="flash_attention_2"):
         data_args.model_type = "qwen2vl"
 
     print(f'the initlized model is {model_args.model_name_or_path} the class is {model.__class__.__name__}')
+
+    if data_args.model_type == "qwen3vl":
+        vivid_enabled = os.environ.get("QWEN3_VIVID_ENABLED", "1") != "0"
+        vivid_anchors = int(os.environ.get("QWEN3_VIVID_ANCHORS", "256"))
+        vivid_topk = int(os.environ.get("QWEN3_VIVID_TOPK", "8"))
+        patched = apply_vivid_qwen3_vision_patch(
+            model,
+            num_anchors=vivid_anchors,
+            topk=vivid_topk,
+            enabled=vivid_enabled,
+        )
+        vivid_blocks = count_vivid_qwen3_blocks(model)
+        strict = os.environ.get("QWEN3_VIVID_STRICT", "1") != "0"
+        if vivid_enabled and strict and not is_vivid_qwen3_vision_patched(model):
+            raise RuntimeError(
+                "VIVID patch requested but not applied: no Qwen3 vision block uses Qwen3VIVIDVisionAttention."
+            )
+
+        if patched > 0 or vivid_blocks > 0:
+            rank0_print(
+                f"VIVID Qwen3 vision status: patched_now={patched}, vivid_blocks={vivid_blocks}, anchors={vivid_anchors}, topk={vivid_topk}, enabled={vivid_enabled}"
+            )
+
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
     )

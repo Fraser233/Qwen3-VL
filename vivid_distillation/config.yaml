@@ -1,0 +1,25 @@
+model:
+  teacher_model_name_or_path: "Qwen/Qwen3-VL-4B-Instruct"
+  student_model_name_or_path: "Qwen/Qwen3-VL-2B-Instruct"
+  trust_remote_code: true
+  torch_dtype: "bf16"
+  device_map: "auto"
+
+vivid:
+  enabled: true
+  anchors: 256
+  topk: 8
+
+training:
+  output_dir: "rsu-side/src/models/outputs/qwen3_vivid_distill"
+  epochs: 1
+  learning_rate: 2.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  kl_temperature: 1.0
+  kl_weight: 1.0
+  best_metric_mode: "min"
+
+runtime:
+  seed: 42
+  max_new_tokens: 64

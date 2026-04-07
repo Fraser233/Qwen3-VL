@@ -2,17 +2,17 @@ import os
 import sys
 import json
 import argparse
+import importlib.util
 import numpy as np
 import time
 from tqdm import tqdm
+from pathlib import Path
 from typing import List, Dict, Any
 from collections import defaultdict, OrderedDict
 import torch
 
-# vLLM imports
-from vllm import LLM, SamplingParams
 from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor
+from transformers import AutoProcessor, AutoModelForImageTextToText
 
 # pycocotools imports
 from pycocotools.coco import COCO
@@ -21,117 +21,330 @@ from pycocotools.coco import COCO
 from dataset_utils import load_odinw_config, generate_odinw_jobs
 from eval_utils import compute_metrics
 
-# Set vLLM multiprocessing method
-os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
+DEFAULT_ODINW_DIR = "/media/chenxi/ISC/VIVID/ODinW-13"
 
 
-def prepare_inputs_for_vllm(messages, processor):
-    """Prepare inputs for vLLM."""
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    
-    # qwen_vl_utils 0.0.14+ required
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        image_patch_size=processor.image_processor.patch_size,
-        return_video_kwargs=True,
-        return_video_metadata=True
+def _load_dynamic_patch_module():
+    root = Path(__file__).resolve().parents[3]
+    patch_path = root / "Dynamic-Qwen3VL" / "dynamic_patch.py"
+    if not patch_path.exists():
+        raise RuntimeError(f"Dynamic patch file not found: {patch_path}")
+
+    spec = importlib.util.spec_from_file_location("dynamic_qwen3_patch_runtime", str(patch_path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load dynamic patch module from: {patch_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _iter_checkpoint_state_dicts(model_path: str):
+    safe_index = os.path.join(model_path, "model.safetensors.index.json")
+    bin_index = os.path.join(model_path, "pytorch_model.bin.index.json")
+    safe_single = os.path.join(model_path, "model.safetensors")
+    bin_single = os.path.join(model_path, "pytorch_model.bin")
+
+    if os.path.exists(safe_index):
+        with open(safe_index, "r", encoding="utf-8") as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+    elif os.path.exists(bin_index):
+        with open(bin_index, "r", encoding="utf-8") as f:
+            shard_files = sorted(set(json.load(f)["weight_map"].values()))
+    elif os.path.exists(safe_single):
+        shard_files = ["model.safetensors"]
+    elif os.path.exists(bin_single):
+        shard_files = ["pytorch_model.bin"]
+    else:
+        raise RuntimeError(f"No checkpoint shard/index found in: {model_path}")
+
+    safe_loader = None
+    for shard_name in shard_files:
+        shard_path = os.path.join(model_path, shard_name)
+        if shard_name.endswith(".safetensors"):
+            if safe_loader is None:
+                from safetensors.torch import load_file as safe_loader
+            state = safe_loader(shard_path)
+        else:
+            state = torch.load(shard_path, map_location="cpu")
+            if isinstance(state, dict) and "state_dict" in state and isinstance(state["state_dict"], dict):
+                state = state["state_dict"]
+        yield state
+
+
+def _apply_dynamic_patch_and_reload_weights(model, model_path: str) -> None:
+    dynamic_enabled = os.environ.get("QWEN3_DYNAMIC_ENABLED", "1") != "0"
+    if not dynamic_enabled:
+        print("Dynamic patch disabled via QWEN3_DYNAMIC_ENABLED=0")
+        return
+
+    dynamic_mode = os.environ.get("QWEN3_DYNAMIC_MODE", "hard_shrink").strip().lower()
+    dynamic_keep_ratio = float(os.environ.get("QWEN3_DYNAMIC_KEEP_RATIO", "0.7"))
+    dynamic_min_keep = int(os.environ.get("QWEN3_DYNAMIC_MIN_KEEP", "32"))
+
+    stage_ratios_env = os.environ.get("QWEN3_DYNAMIC_STAGE_RATIOS", "").strip()
+    stage_ratios = [float(x.strip()) for x in stage_ratios_env.split(",") if x.strip()] if stage_ratios_env else None
+
+    pruning_locs_env = os.environ.get("QWEN3_DYNAMIC_PRUNING_LOCS", "").strip()
+    pruning_locs = [int(x.strip()) for x in pruning_locs_env.split(",") if x.strip()] if pruning_locs_env else None
+
+    patch_mod = _load_dynamic_patch_module()
+    if dynamic_mode == "hard_shrink":
+        patched = patch_mod.apply_dynamic_qwen3_hard_shrink_patch(
+            model,
+            keep_ratio=dynamic_keep_ratio,
+            keep_ratios=stage_ratios,
+            pruning_locs=pruning_locs,
+            min_keep_tokens=dynamic_min_keep,
+            enabled=dynamic_enabled,
+        )
+    else:
+        patched = patch_mod.apply_dynamic_qwen3_vision_patch(
+            model,
+            keep_ratio=dynamic_keep_ratio,
+            keep_ratios=stage_ratios,
+            pruning_locs=pruning_locs,
+            min_keep_tokens=dynamic_min_keep,
+            enabled=dynamic_enabled,
+        )
+
+    dynamic_blocks = patch_mod.count_dynamic_qwen3_blocks(model)
+    strict = os.environ.get("QWEN3_DYNAMIC_STRICT", "1") != "0"
+    if strict and dynamic_blocks <= 0:
+        raise RuntimeError("Dynamic patch requested but no Qwen3 vision blocks were patched.")
+
+    model_keys = set(model.state_dict().keys())
+    dynamic_key_markers = ("score_norm", "score_in", "score_out", "base_block", "base_attn")
+    loaded_keys = 0
+    loaded_dynamic_keys = 0
+
+    for shard_state in _iter_checkpoint_state_dicts(model_path):
+        matched = {k: v for k, v in shard_state.items() if k in model_keys}
+        if not matched:
+            continue
+        model.load_state_dict(matched, strict=False)
+        loaded_keys += len(matched)
+        loaded_dynamic_keys += sum(1 for k in matched if any(m in k for m in dynamic_key_markers))
+
+    if strict and loaded_dynamic_keys == 0:
+        raise RuntimeError(
+            "Dynamic patch applied but no dynamic wrapper checkpoint keys were loaded. "
+            "Ensure checkpoint matches selected dynamic mode."
+        )
+
+    print(
+        f"✓ Dynamic patch applied: mode={dynamic_mode}, patched_now={patched}, dynamic_blocks={dynamic_blocks}, "
+        f"loaded_keys={loaded_keys}, loaded_dynamic_keys={loaded_dynamic_keys}"
     )
-    
-    mm_data = {}
-    if image_inputs is not None:
-        mm_data['image'] = image_inputs
-    if video_inputs is not None:
-        mm_data['video'] = video_inputs
-    
-    return {
-        'prompt': text,
-        'multi_modal_data': mm_data,
-        'mm_processor_kwargs': video_kwargs
-    }
+
+
+def _resolve_base_model_path_for_dynamic(checkpoint_path: str) -> str:
+    def _resolve_candidate(candidate: str) -> str | None:
+        cand = str(candidate or "").strip()
+        if not cand:
+            return None
+
+        p = Path(cand).expanduser()
+        if p.is_absolute():
+            return str(p.resolve()) if p.exists() else None
+
+        is_path_like = ("/" in cand) or ("\\" in cand) or cand.startswith(".")
+        if is_path_like:
+            bases = [
+                Path(checkpoint_path),
+                Path(checkpoint_path).parent,
+                Path(checkpoint_path).parents[1],
+                Path.cwd(),
+            ]
+            for b in bases:
+                cp = (b / p).resolve()
+                if cp.exists():
+                    return str(cp)
+            return None
+
+        return cand
+
+    dynamic_enabled = os.environ.get("QWEN3_DYNAMIC_ENABLED", "1") != "0"
+    if not dynamic_enabled:
+        return checkpoint_path
+
+    base_path = os.environ.get("QWEN3_BASE_MODEL_PATH", "").strip()
+    if base_path:
+        resolved = _resolve_candidate(base_path)
+        if resolved is None:
+            raise RuntimeError(f"QWEN3_BASE_MODEL_PATH could not be resolved: {base_path}")
+        return resolved
+
+    distill_state_path = os.path.join(checkpoint_path, "distill_state.json")
+    if os.path.exists(distill_state_path):
+        try:
+            with open(distill_state_path, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            candidate = str(
+                state.get("student_model_name_or_path")
+                or state.get("teacher_model_name_or_path")
+                or ""
+            ).strip()
+            if candidate:
+                resolved = _resolve_candidate(candidate)
+                if resolved is not None:
+                    print(f"Using base model from distill_state.json: {resolved}")
+                    return resolved
+        except Exception:
+            pass
+
+    fallback = os.environ.get("QWEN3_DEFAULT_BASE_MODEL", "Qwen/Qwen3-VL-2B-Instruct").strip()
+    if fallback:
+        print(f"Using default base model: {fallback}")
+        return fallback
+
+    raise RuntimeError(
+        "Dynamic checkpoint requires a base Qwen3-VL model to initialize architecture without mismatch warnings. "
+        "Set QWEN3_BASE_MODEL_PATH or include student_model_name_or_path in distill_state.json."
+    )
+
+
+def _sanitize_local_tokenizer_config(model_path: str) -> None:
+    cfg_path = os.path.join(model_path, "tokenizer_config.json")
+    if not os.path.exists(cfg_path):
+        return
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+
+    extra = cfg.get("extra_special_tokens")
+    if isinstance(extra, list):
+        cfg["extra_special_tokens"] = {
+            f"extra_special_token_{i}": tok for i, tok in enumerate(extra)
+        }
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print("Warning: normalized tokenizer_config.json extra_special_tokens from list to dict.")
+
+
+def _sanitize_local_model_config(model_path: str) -> None:
+    cfg_path = os.path.join(model_path, "config.json")
+    if not os.path.exists(cfg_path):
+        return
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+
+    text_cfg = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else None
+    if not text_cfg:
+        return
+
+    if text_cfg.get("rope_scaling") is None and isinstance(text_cfg.get("rope_parameters"), dict):
+        text_cfg["rope_scaling"] = text_cfg["rope_parameters"]
+        cfg["text_config"] = text_cfg
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        print("Warning: normalized config.json text_config.rope_scaling from rope_parameters.")
+
+
+def _prepare_hf_inputs(messages, processor, model_device):
+    """Prepare inputs for Transformers generation."""
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    vis = process_vision_info(messages)
+    if isinstance(vis, tuple) and len(vis) >= 2:
+        image_inputs, video_inputs = vis[0], vis[1]
+    else:
+        image_inputs, video_inputs = None, None
+
+    model_inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
+    return {k: v.to(model_device) if hasattr(v, "to") else v for k, v in model_inputs.items()}
 
 
 def run_inference(args):
-    """Run inference on the ODinW dataset using vLLM."""
+    """Run inference on the ODinW dataset using Transformers (no vLLM)."""
     print("\n" + "="*80)
-    print("🚀 ODinW Inference with vLLM (High-Speed Mode)")
+    print("🚀 ODinW Inference with Transformers")
     print("="*80 + "\n")
     
     # Generate task list
     question_list, datasets = generate_odinw_jobs(args.data_dir, args)
+    if getattr(args, "max_samples", None) is not None and args.max_samples > 0:
+        question_list = question_list[:args.max_samples]
+        print(f"⚠️  Testing mode: Processing only first {len(question_list)} samples")
     print(f"✓ Generated {len(question_list)} inference jobs\n")
     
     # Create output directory
     os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
     
-    # Set up generation parameters
-    sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-        max_tokens=args.max_new_tokens,
-        repetition_penalty=args.repetition_penalty,
-        presence_penalty=args.presence_penalty,
-        stop_token_ids=[],
-    )
-    
-    print(f"\n⚙️  Generation parameters (vLLM SamplingParams):")
-    print(f"   max_tokens={sampling_params.max_tokens}")
-    print(f"   temperature={sampling_params.temperature}, top_p={sampling_params.top_p}, top_k={sampling_params.top_k}")
-    print(f"   repetition_penalty={sampling_params.repetition_penalty}")
-    print(f"   presence_penalty={sampling_params.presence_penalty}")
+    print(f"\n⚙️  Generation parameters (Transformers):")
+    print(f"   max_new_tokens={args.max_new_tokens}")
+    print(f"   temperature={args.temperature}, top_p={args.top_p}, top_k={args.top_k}")
+    print(f"   repetition_penalty={args.repetition_penalty}")
+    print(f"   presence_penalty={args.presence_penalty}")
     print()
     
     # Load processor
     print(f"Loading processor from {args.model_path}")
-    processor = AutoProcessor.from_pretrained(args.model_path)
+    _sanitize_local_tokenizer_config(args.model_path)
+    _sanitize_local_model_config(args.model_path)
+    processor = AutoProcessor.from_pretrained(
+        args.model_path,
+        trust_remote_code=True,
+        local_files_only=True,
+    )
     print("✓ Processor loaded\n")
     
-    # Initialize vLLM
-    print(f"Initializing vLLM with model: {args.model_path}")
-    print(f"   GPU count: {torch.cuda.device_count()}")
-    print(f"   Tensor parallel size: {args.tensor_parallel_size}")
-    
-    llm = LLM(
-        model=args.model_path,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+    # Initialize HF model
+    model_load_path = _resolve_base_model_path_for_dynamic(args.model_path)
+    _sanitize_local_model_config(model_load_path)
+    print(f"Loading model with Transformers from: {model_load_path}")
+    model_load_is_local = Path(model_load_path).expanduser().exists()
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_load_path,
         trust_remote_code=True,
-        max_model_len=args.max_model_len,
-        limit_mm_per_prompt={"image": args.max_images_per_prompt},
-        seed=42,
+        local_files_only=model_load_is_local,
+        dtype=torch.bfloat16,
+        device_map="auto",
     )
-    print("✓ vLLM initialized successfully\n")
-    
-    # Prepare all inputs
-    print("Preparing inputs for vLLM...")
-    all_inputs = []
-    
-    for item in tqdm(question_list, desc="Building prompts"):
-        vllm_input = prepare_inputs_for_vllm(item['messages'], processor)
-        all_inputs.append(vllm_input)
-    
-    print(f"✓ Prepared {len(all_inputs)} inputs\n")
-    
-    # Batch inference
+    _apply_dynamic_patch_and_reload_weights(model, args.model_path)
+    model.eval()
+
+    model_device = next(model.parameters()).device
+    print(f"✓ Model loaded on device: {model_device}\n")
+
+    # Inference loop
     print("="*80)
-    print("🚀 Running vLLM batch inference")
+    print("🚀 Running Transformers inference")
     print("="*80)
     start_time = time.time()
-    
-    outputs = llm.generate(all_inputs, sampling_params=sampling_params)
-    
+
     end_time = time.time()
-    total_time = end_time - start_time
-    print(f"\n✓ Inference completed in {total_time:.2f} seconds")
-    print(f"  Average: {total_time/len(question_list):.2f} seconds/sample")
-    print(f"  Throughput: {len(question_list)/total_time:.2f} samples/second\n")
-    
+
     # Save results
     print("Saving results...")
     results = []
-    
-    for idx, (item, output) in enumerate(zip(question_list, outputs)):
-        response = output.outputs[0].text
+
+    for idx, item in enumerate(tqdm(question_list, desc="Generating")):
+        model_inputs = _prepare_hf_inputs(item['messages'], processor, model_device)
+        input_len = model_inputs["input_ids"].shape[1]
+        with torch.no_grad():
+            generated = model.generate(
+                **model_inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                repetition_penalty=args.repetition_penalty,
+                pad_token_id=processor.tokenizer.eos_token_id,
+            )
+        gen_ids = generated[:, input_len:]
+        response = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
         
         # Handle </think> tag
         response_final = str(response).split("</think>")[-1].strip()
@@ -144,6 +357,11 @@ def run_inference(args):
             "messages": item['messages']
         }
         results.append(result)
+
+    total_time = time.time() - start_time
+    print(f"\n✓ Inference completed in {total_time:.2f} seconds")
+    print(f"  Average: {total_time/len(question_list):.2f} seconds/sample")
+    print(f"  Throughput: {len(question_list)/total_time:.2f} samples/second\n")
     
     # Save results
     with open(args.output_file, 'w') as f:
@@ -343,9 +561,14 @@ def main():
     # Inference parser
     infer_parser = subparsers.add_parser("infer", help="Run inference with vLLM")
     infer_parser.add_argument("--model-path", type=str, required=True, help="Path to the model")
-    infer_parser.add_argument("--data-dir", type=str, required=True, 
-                             help="Path to ODinW data directory (containing odinw13_config.py)")
+    infer_parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=DEFAULT_ODINW_DIR,
+        help="Path to ODinW data directory (containing odinw13_config.py)",
+    )
     infer_parser.add_argument("--output-file", type=str, required=True, help="Output file path")
+    infer_parser.add_argument("--max-samples", type=int, default=None, help="Maximum samples to process (for testing)")
     
     # vLLM specific parameters
     infer_parser.add_argument("--tensor-parallel-size", type=int, default=None,
@@ -373,14 +596,22 @@ def main():
     
     # Evaluation parser
     eval_parser = subparsers.add_parser("eval", help="Run evaluation")
-    eval_parser.add_argument("--data-dir", type=str, required=True,
-                           help="Path to ODinW data directory (containing odinw13_config.py)")
+    eval_parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=DEFAULT_ODINW_DIR,
+        help="Path to ODinW data directory (containing odinw13_config.py)",
+    )
     eval_parser.add_argument("--input-file", type=str, required=True,
                            help="Input file with inference results")
     eval_parser.add_argument("--output-file", type=str, required=True,
                            help="Output file path")
     
     args = parser.parse_args()
+
+    if hasattr(args, 'data_dir'):
+        args.data_dir = str(args.data_dir).strip() or DEFAULT_ODINW_DIR
+        args.data_dir = os.path.abspath(args.data_dir)
     
     # Automatically set tensor_parallel_size
     if args.command == 'infer' and args.tensor_parallel_size is None:

@@ -21,9 +21,11 @@ FAIL_MSG = 'Failed to obtain answer via API.'
 
 def is_equal(asw: str, gt_asw: str) -> bool:
     """Check if two answers are equal."""
-    if not isinstance(asw, str) or not isinstance(gt_asw, str):
-        print('Warning: input is not string')
-        print(asw, gt_asw)
+    # Non-string placeholders (e.g., False) are treated as mismatch quietly.
+    if isinstance(asw, bool) or asw is None:
+        return False
+    if isinstance(gt_asw, bool) or gt_asw is None:
+        return False
     asw = str(asw).lower().strip()
     gt_asw = str(gt_asw).lower().strip()
     if gt_asw == asw:
@@ -310,10 +312,16 @@ def build_judge(model, api_type):
     if api_type == 'mit':
         api_key = os.environ.get('MIT_SPIDER_TOKEN', '')
         api_base = os.environ.get('MIT_SPIDER_URL', '')
+        if not api_key or not api_base:
+            print("Warning: MIT judge API config is missing. Falling back to rule-only MathVision evaluation.")
+            return None
         return OpenAIWrapper(model, api_base, api_key)
     elif api_type == 'dash':
         api_key = os.environ.get('CHATGPT_DASHSCOPE_API_KEY', '')
         api_base = os.environ.get('DASHSCOPE_API_BASE', '')
+        if not api_key or not api_base:
+            print("Warning: DashScope judge API config is missing. Falling back to rule-only MathVision evaluation.")
+            return None
         return DashScopeWrapper(model, api_base, api_key)
     else:
         raise ValueError(f"Unsupported API type: {api_type}")
@@ -339,6 +347,21 @@ def MATH_V_auxeval(args):
         return dict(log=log, res=res, extract_model='rule', extract_flag=extract_flag)
     
     # Use model-based extraction
+    if model is None:
+        prediction = str(line.get('prediction', ''))
+        fallback_res = post_check(line, prefetch=True)
+        if not fallback_res:
+            try:
+                choices_raw = line.get('choices', '[]')
+                choices = list_to_dict(eval(choices_raw)) if isinstance(choices_raw, str) else list_to_dict(choices_raw)
+                fallback_res = can_infer(prediction, choices)
+            except Exception:
+                fallback_res = False
+        if not fallback_res:
+            fallback_res = 'Z'
+        log += f'Judge model unavailable. Fallback extracted answer: {fallback_res}.\n'
+        return dict(log=log, res=str(fallback_res), extract_model='fallback', extract_flag=False)
+
     for i in range(retry):
         prediction = line['prediction']
         res = model.generate(prompt, temperature=i * 0.5)
