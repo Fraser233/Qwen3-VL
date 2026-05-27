@@ -209,7 +209,26 @@ def _read_video_torchvision(
         pts_unit="sec",
         output_format="TCHW",
     )
-    total_frames, video_fps = video.size(0), info["video_fps"]
+    total_frames = int(video.size(0))
+    if total_frames <= 0:
+        raise RuntimeError(f"Decoded empty video from {video_path}")
+
+    video_fps = info.get("video_fps", None)
+    if video_fps is None:
+        video_fps = info.get("fps", None)
+    if video_fps is None or float(video_fps) <= 0:
+        duration = info.get("video_duration", None)
+        if duration is not None and float(duration) > 0:
+            video_fps = float(total_frames) / float(duration)
+        else:
+            video_fps = float(ele.get("fps", FPS))
+        logger.warning(
+            "torchvision metadata missing video_fps for %s; fallback fps=%s",
+            video_path,
+            video_fps,
+        )
+
+    video_fps = float(video_fps)
     logger.info(f"torchvision:  {video_path=}, {total_frames=}, {video_fps=}, time={time.time() - st:.3f}s")
     nframes = smart_nframes(ele, total_frames=total_frames, video_fps=video_fps)
     idx = torch.linspace(0, total_frames - 1, nframes).round().long()

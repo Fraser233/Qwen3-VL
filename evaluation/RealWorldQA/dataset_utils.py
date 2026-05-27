@@ -37,10 +37,26 @@ def load_dataset(dataset_name='RealWorldQA'):
     file_name = f"{dataset_name}.tsv"
     data_path = os.path.join(data_root, file_name)
     
+    url = os.environ.get("REALWORLDQA_DATASET_URL", REALWORLDQA_DATASET_URL).strip()
+    skip_md5 = os.environ.get("REALWORLDQA_SKIP_MD5", "0") == "1"
+
     # Download dataset if not exists or MD5 mismatch
-    if not os.path.exists(data_path) or md5(data_path) != REALWORLDQA_DATASET_MD5:
+    needs_download = (not os.path.exists(data_path)) or (not skip_md5 and md5(data_path) != REALWORLDQA_DATASET_MD5)
+    if needs_download:
         print(f"Downloading {dataset_name} dataset...")
-        download_file(REALWORLDQA_DATASET_URL, data_path)
+        try:
+            download_file(url, data_path)
+        except Exception as exc:
+            if os.path.exists(data_path):
+                print(
+                    f"Warning: download failed ({exc}); using existing local file: {data_path}."
+                )
+            else:
+                raise RuntimeError(
+                    f"Failed to download RealWorldQA dataset from {url}. "
+                    "If SSL verification fails, set REALWORLDQA_INSECURE_DOWNLOAD=1, "
+                    "or download manually and place the TSV under LMUData."
+                ) from exc
     
     # Load dataset
     data = pd.read_csv(data_path, sep='\t')
@@ -147,7 +163,7 @@ def build_realworldqa_prompt(line, dump_image_func, min_pixels, max_pixels):
     prompt += f'Question: {question}\n'
     if len(options):
         prompt += options_prompt
-        prompt += 'Please select the correct answer from the options above. \n'
+        prompt += 'Please select the correct answer from the options above. Answer with the option letter first and do not explain. \n'
     
     # Build messages in standard conversation format
     content = []
@@ -179,4 +195,3 @@ def build_realworldqa_prompt(line, dump_image_func, min_pixels, max_pixels):
     }]
     
     return messages
-

@@ -25,12 +25,31 @@ def load_dataset(dataset_name='MathVision'):
     file_name = f"{dataset_name}.tsv"
     data_path = os.path.join(data_root, file_name)
     
+    url_override = os.environ.get("MATHVISION_DATASET_URL", "").strip()
+    url = url_override or MATHVISION_DATASET_URL.get(dataset_name, "")
+    skip_md5 = os.environ.get("MATHVISION_SKIP_MD5", "0") == "1"
+
     # Download if not exists or MD5 doesn't match
     if dataset_name in MATHVISION_DATASET_MD5:
         expected_md5 = MATHVISION_DATASET_MD5[dataset_name]
-        if not os.path.exists(data_path) or md5(data_path) != expected_md5:
+        needs_download = (not os.path.exists(data_path)) or (not skip_md5 and md5(data_path) != expected_md5)
+        if needs_download:
+            if not url:
+                raise RuntimeError(f"No download URL configured for dataset: {dataset_name}")
             print(f"Downloading {dataset_name} dataset...")
-            download_file(MATHVISION_DATASET_URL[dataset_name], data_path)
+            try:
+                download_file(url, data_path)
+            except Exception as exc:
+                if os.path.exists(data_path):
+                    print(
+                        f"Warning: download failed ({exc}); using existing local file: {data_path}."
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Failed to download MathVision dataset from {url}. "
+                        "If SSL verification fails, set MATHVISION_INSECURE_DOWNLOAD=1, "
+                        "or download manually and place the TSV under LMUData."
+                    ) from exc
     
     # Load the dataset
     data = pd.read_csv(data_path, sep='\t')

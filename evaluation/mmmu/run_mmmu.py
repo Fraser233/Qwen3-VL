@@ -27,23 +27,295 @@ def _sync_if_cuda():
         torch.cuda.synchronize()
 
 
+def _should_sample(args) -> bool:
+    return not (float(args.temperature) <= 0.02 and int(args.top_k) == 1)
+
+
+def _build_generate_kwargs(args, processor) -> dict:
+    kwargs = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": _should_sample(args),
+        "repetition_penalty": args.repetition_penalty,
+        "pad_token_id": processor.tokenizer.eos_token_id,
+    }
+    if kwargs["do_sample"]:
+        kwargs.update(
+            {
+                "temperature": args.temperature,
+                "top_p": args.top_p,
+                "top_k": args.top_k,
+            }
+        )
+    return kwargs
+
+
+def _reset_dynamic_token_counters(visual_mod) -> None:
+    if visual_mod is None:
+        return
+    for attr in (
+        "_diffrate_last_alive_tokens",
+        "_diffrate_last_total_tokens",
+        "_diffrate_last_layer_token_stats",
+        "_dymu_last_alive_tokens",
+        "_dymu_last_total_tokens",
+        "_dymu_last_layer_token_stats",
+        "_dynamic_last_alive_tokens",
+        "_dynamic_last_total_tokens",
+        "_dynamic_last_layer_token_stats",
+        "_visiontrim_last_alive_tokens",
+        "_visiontrim_last_total_tokens",
+        "_visiontrim_last_layer_token_stats",
+        "_visiontrim_last_llm_prefill_tokens",
+        "_visiontrim_last_dense_prefill_tokens",
+        "_zooprune_last_alive_tokens",
+        "_zooprune_last_total_tokens",
+        "_zooprune_last_layer_token_stats",
+        "_zooprune_last_llm_prefill_tokens",
+        "_zooprune_last_dense_prefill_tokens",
+        "_diffrate_last_llm_prefill_tokens",
+        "_diffrate_last_dense_prefill_tokens",
+        "_vivid_last_alive_tokens",
+        "_vivid_last_total_tokens",
+        "_vivid_last_layer_token_stats",
+        "_vivid_last_llm_prefill_tokens",
+        "_vivid_last_dense_prefill_tokens",
+        "_last_compression_overhead_ms",
+        "_dymu_last_compression_overhead_ms",
+        "_diffrate_last_compression_overhead_ms",
+        "_dynamic_last_compression_overhead_ms",
+        "_visiontrim_last_compression_overhead_ms",
+        "_zooprune_last_compression_overhead_ms",
+        "_vivid_last_compression_overhead_ms",
+    ):
+        if hasattr(visual_mod, attr):
+            setattr(visual_mod, attr, [] if attr.endswith("_layer_token_stats") else None)
+
+
+def _read_dynamic_alive_tokens(visual_mod) -> int | None:
+    if visual_mod is None:
+        return None
+    for attr in (
+        "_dymu_last_alive_tokens",
+        "_diffrate_last_alive_tokens",
+        "_dynamic_last_alive_tokens",
+        "_visiontrim_last_alive_tokens",
+        "_zooprune_last_alive_tokens",
+        "_vivid_last_alive_tokens",
+    ):
+        value = getattr(visual_mod, attr, None)
+        if isinstance(value, (int, float)):
+            return max(0, int(value))
+    return None
+
+
+def _read_dynamic_llm_prefill_tokens(model, visual_mod, fallback: int) -> int:
+    candidates = [
+        visual_mod,
+        getattr(model, "model", None),
+        model,
+    ]
+    attrs = (
+        "_visiontrim_last_llm_prefill_tokens",
+        "_zooprune_last_llm_prefill_tokens",
+        "_diffrate_last_llm_prefill_tokens",
+        "_dymu_last_llm_prefill_tokens",
+        "_dynamic_last_llm_prefill_tokens",
+        "_vivid_last_llm_prefill_tokens",
+    )
+    for obj in candidates:
+        if obj is None:
+            continue
+        for attr in attrs:
+            value = getattr(obj, attr, None)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+    return int(fallback)
+
+
+def _read_dynamic_layer_token_stats(visual_mod) -> list[dict]:
+    if visual_mod is None:
+        return []
+    for attr in (
+        "_dymu_last_layer_token_stats",
+        "_diffrate_last_layer_token_stats",
+        "_dynamic_last_layer_token_stats",
+        "_visiontrim_last_layer_token_stats",
+        "_zooprune_last_layer_token_stats",
+        "_vivid_last_layer_token_stats",
+    ):
+        value = getattr(visual_mod, attr, None)
+        if isinstance(value, list) and value:
+            return [dict(x) for x in value if isinstance(x, dict)]
+    return []
+
+
+def _read_dynamic_compression_overhead_ms(model, visual_mod) -> float:
+    candidates = [
+        visual_mod,
+        getattr(model, "model", None),
+        model,
+    ]
+    attrs = (
+        "_last_compression_overhead_ms",
+        "_dymu_last_compression_overhead_ms",
+        "_diffrate_last_compression_overhead_ms",
+        "_dynamic_last_compression_overhead_ms",
+        "_visiontrim_last_compression_overhead_ms",
+        "_zooprune_last_compression_overhead_ms",
+        "_vivid_last_compression_overhead_ms",
+    )
+    for obj in candidates:
+        if obj is None:
+            continue
+        for attr in attrs:
+            value = getattr(obj, attr, None)
+            if isinstance(value, (int, float)) and value > 0:
+                return float(value)
+    return 0.0
+
+
+def _merge_layer_token_stats(per_layer: dict, stats: list[dict], fallback_full_tokens: int) -> None:
+    for item in stats:
+        try:
+            layer_id = int(item.get("layer"))
+        except Exception:
+            continue
+        key = f"vision_block_{layer_id}"
+        entry = per_layer.setdefault(
+            key,
+            {
+                "family": "vision_block",
+                "layer": layer_id,
+                "seconds": 0.0,
+                "calls": 0,
+            },
+        )
+        tokens_in = int(item.get("tokens_in", 0) or 0)
+        tokens_out = int(item.get("tokens_out", 0) or 0)
+        full_tokens = int(item.get("full_tokens", fallback_full_tokens) or fallback_full_tokens or 0)
+        entry["tokens_in"] = int(entry.get("tokens_in", 0)) + tokens_in
+        entry["tokens_out"] = int(entry.get("tokens_out", 0)) + tokens_out
+        entry["full_tokens"] = int(entry.get("full_tokens", 0)) + full_tokens
+        entry["compressed_calls"] = int(entry.get("compressed_calls", 0)) + (1 if bool(item.get("compressed", False)) else 0)
+        if entry["tokens_in"] > 0:
+            entry["local_keep_ratio"] = float(entry["tokens_out"]) / float(entry["tokens_in"])
+        if entry["full_tokens"] > 0:
+            entry["cumulative_keep_ratio"] = float(entry["tokens_out"]) / float(entry["full_tokens"])
+
+
+def _resolve_model_dtype():
+    name = os.environ.get("QWEN3_EVAL_MODEL_DTYPE", "bfloat16").strip().lower()
+    aliases = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    if name not in aliases:
+        raise ValueError(f"Unsupported QWEN3_EVAL_MODEL_DTYPE={name!r}; use bfloat16, float16, or float32")
+    return aliases[name]
+
+
+def _count_visual_tokens_from_grid(grid_tensor):
+    if grid_tensor is None or not torch.is_tensor(grid_tensor) or grid_tensor.numel() == 0:
+        return 0
+    g = grid_tensor.detach().to("cpu")
+    if g.ndim == 1:
+        if g.shape[0] >= 3:
+            return int(g[0].item() * g[1].item() * g[2].item())
+        return 0
+    return int((g[:, 0] * g[:, 1] * g[:, 2]).sum().item())
+
+
+def _count_visual_tokens_from_model_inputs(model_inputs):
+    return int(
+        _count_visual_tokens_from_grid(model_inputs.get("image_grid_thw"))
+        + _count_visual_tokens_from_grid(model_inputs.get("video_grid_thw"))
+    )
+
+
+def _extract_token_count_from_obj(obj):
+    if torch.is_tensor(obj):
+        if obj.ndim == 2:
+            return int(obj.shape[0])
+        if obj.ndim >= 3:
+            return int(np.prod(obj.shape[:-1]))
+        return None
+    if isinstance(obj, (list, tuple)):
+        for x in obj:
+            tok = _extract_token_count_from_obj(x)
+            if tok is not None:
+                return tok
+        return None
+    if isinstance(obj, dict):
+        for x in obj.values():
+            tok = _extract_token_count_from_obj(x)
+            if tok is not None:
+                return tok
+        return None
+    return None
+
+
 def _install_component_timers(model):
     timers = {
         "input_embedding_sec": 0.0,
         "vision_encoder_sec": 0.0,
         "projection_sec": 0.0,
+        "llm_prefill_sec": 0.0,
+        "llm_decode_sec": 0.0,
     }
     counts = {
         "input_embedding_calls": 0,
         "vision_encoder_calls": 0,
         "projection_calls": 0,
+        "llm_prefill_calls": 0,
+        "llm_decode_calls": 0,
     }
+    token_counters = {
+        "projection_input_tokens": 0,
+        "projection_input_tokens_calls": 0,
+    }
+    per_layer = {}
     handles = []
 
-    def _add_hooks(module, key_time, key_count):
+    def _add_hooks(module, key_time, key_count, token_counter_key=None):
         if module is None:
             return
 
+        state = {"t0": None}
+
+        def _pre_hook(_m, _args):
+            _sync_if_cuda()
+            state["t0"] = time.time()
+            if token_counter_key is not None:
+                tok = _extract_token_count_from_obj(_args)
+                if tok is not None:
+                    token_counters[token_counter_key] += int(tok)
+                    token_counters[f"{token_counter_key}_calls"] += 1
+
+        def _post_hook(_m, _args, _out):
+            _sync_if_cuda()
+            if state["t0"] is not None:
+                timers[key_time] += time.time() - state["t0"]
+                counts[key_count] += 1
+                state["t0"] = None
+
+        handles.append(module.register_forward_pre_hook(_pre_hook))
+        handles.append(module.register_forward_hook(_post_hook))
+
+    def _add_layer_hooks(module, family, layer_id, initialize=True):
+        if module is None:
+            return
+        key = f"{family}_{layer_id}"
+        if initialize or key not in per_layer:
+            per_layer[key] = {
+                "family": family,
+                "layer": int(layer_id),
+                "seconds": 0.0,
+                "calls": 0,
+            }
         state = {"t0": None}
 
         def _pre_hook(_m, _args):
@@ -53,8 +325,8 @@ def _install_component_timers(model):
         def _post_hook(_m, _args, _out):
             _sync_if_cuda()
             if state["t0"] is not None:
-                timers[key_time] += time.time() - state["t0"]
-                counts[key_count] += 1
+                per_layer[key]["seconds"] += time.time() - state["t0"]
+                per_layer[key]["calls"] += 1
                 state["t0"] = None
 
         handles.append(module.register_forward_pre_hook(_pre_hook))
@@ -69,6 +341,21 @@ def _install_component_timers(model):
 
     visual = getattr(getattr(model, "model", None), "visual", None) or getattr(model, "visual", None)
     _add_hooks(visual, "vision_encoder_sec", "vision_encoder_calls")
+    split_vision_blocks = os.environ.get("QWEN3_PATCH_IMPL", "").strip().lower() in {
+        "diffrate",
+        "dymu",
+        "visiontrim",
+        "zooprune",
+        "zoo_prune",
+        "zoo-prune",
+        "vivid",
+    }
+    for layer_id, block in enumerate(getattr(visual, "blocks", []) or []):
+        if split_vision_blocks and (getattr(block, "attn", None) is not None or getattr(block, "mlp", None) is not None):
+            _add_layer_hooks(getattr(block, "attn", None), "vision_block", layer_id)
+            _add_layer_hooks(getattr(block, "mlp", None), "vision_block", layer_id, initialize=False)
+        else:
+            _add_layer_hooks(block, "vision_block", layer_id)
 
     projector = None
     model_core = getattr(model, "model", None)
@@ -83,9 +370,57 @@ def _install_component_timers(model):
         if cand is not None:
             projector = cand
             break
-    _add_hooks(projector, "projection_sec", "projection_calls")
+    _add_hooks(projector, "projection_sec", "projection_calls", token_counter_key="projection_input_tokens")
 
-    return timers, counts, handles
+    language_model = (
+        getattr(model_core, "language_model", None)
+        or getattr(model_core, "model", None)
+        or getattr(model, "language_model", None)
+    )
+
+    def _sequence_length(args, kwargs):
+        for key in ("inputs_embeds", "input_ids"):
+            value = kwargs.get(key) if isinstance(kwargs, dict) else None
+            if torch.is_tensor(value) and value.ndim >= 2:
+                return int(value.shape[1])
+        for value in args:
+            if torch.is_tensor(value) and value.ndim >= 2:
+                return int(value.shape[1])
+        return None
+
+    if language_model is not None:
+        state = {"t0": None, "bucket": None}
+
+        def _lm_pre_hook(_m, _args, _kwargs=None):
+            kwargs = _kwargs if isinstance(_kwargs, dict) else {}
+            seq_len = _sequence_length(_args, kwargs)
+            past = kwargs.get("past_key_values")
+            bucket = "llm_decode_sec" if past is not None and seq_len == 1 else "llm_prefill_sec"
+            _sync_if_cuda()
+            state["t0"] = time.time()
+            state["bucket"] = bucket
+
+        def _lm_post_hook(_m, _args, _out):
+            _sync_if_cuda()
+            bucket = state.get("bucket")
+            if state["t0"] is not None and bucket in timers:
+                timers[bucket] += time.time() - state["t0"]
+                counts["llm_decode_calls" if bucket == "llm_decode_sec" else "llm_prefill_calls"] += 1
+            state["t0"] = None
+            state["bucket"] = None
+
+        try:
+            handles.append(language_model.register_forward_pre_hook(_lm_pre_hook, with_kwargs=True))
+        except TypeError:
+            handles.append(language_model.register_forward_pre_hook(lambda m, a: _lm_pre_hook(m, a, {})))
+        handles.append(language_model.register_forward_hook(_lm_post_hook))
+
+    for layer_id, layer in enumerate(getattr(language_model, "layers", []) or []):
+        _add_layer_hooks(layer, "language_layer", layer_id)
+
+    token_counters["per_layer_timing"] = per_layer
+
+    return timers, counts, token_counters, handles
 
 
 def _remove_hooks(handles):
@@ -140,11 +475,35 @@ def _sanitize_local_model_config(model_path: str) -> None:
 
 def _load_dynamic_patch_module():
     root = Path(__file__).resolve().parents[3]
-    patch_path = root / "Dynamic-Qwen3VL" / "dynamic_patch.py"
+    patch_impl = os.environ.get("QWEN3_PATCH_IMPL", "dynamic").strip().lower()
+    if patch_impl == "dymu":
+        patch_path = root / "DyMU" / "qwen3_dymu_patch.py"
+    elif patch_impl == "diffrate":
+        patch_path = root / "DiffRate-Qwen3VL" / "qwen3_diffrate_patch.py"
+    elif patch_impl == "visiontrim":
+        patch_path = root / "VisionTrim-Qwen3VL" / "qwen3_visiontrim_patch.py"
+    elif patch_impl in {"zooprune", "zoo_prune", "zoo-prune"}:
+        patch_path = root / "ZOOPrune-Qwen3VL" / "qwen3_zooprune_patch.py"
+    elif patch_impl == "vivid":
+        patch_path = root / "VIVID-Qwen3VL" / "qwen3_vivid_patch.py"
+    else:
+        patch_path = root / "Dynamic-Qwen3VL" / "dynamic_patch.py"
     if not patch_path.exists():
         raise RuntimeError(f"Dynamic patch file not found: {patch_path}")
 
-    spec = importlib.util.spec_from_file_location("dynamic_qwen3_patch_runtime", str(patch_path))
+    if patch_impl == "dymu":
+        module_name = "dymu_qwen3_patch_runtime"
+    elif patch_impl == "diffrate":
+        module_name = "diffrate_qwen3_patch_runtime"
+    elif patch_impl == "visiontrim":
+        module_name = "visiontrim_qwen3_patch_runtime"
+    elif patch_impl in {"zooprune", "zoo_prune", "zoo-prune"}:
+        module_name = "zooprune_qwen3_patch_runtime"
+    elif patch_impl == "vivid":
+        module_name = "vivid_qwen3_patch_runtime"
+    else:
+        module_name = "dynamic_qwen3_patch_runtime"
+    spec = importlib.util.spec_from_file_location(module_name, str(patch_path))
     if spec is None or spec.loader is None:
         raise RuntimeError(f"Failed to load dynamic patch module from: {patch_path}")
     module = importlib.util.module_from_spec(spec)
@@ -154,6 +513,8 @@ def _load_dynamic_patch_module():
 
 
 def _iter_checkpoint_state_dicts(model_path: str):
+    if not os.path.isdir(model_path):
+        return
     safe_index = os.path.join(model_path, "model.safetensors.index.json")
     bin_index = os.path.join(model_path, "pytorch_model.bin.index.json")
     safe_single = os.path.join(model_path, "model.safetensors")
@@ -192,17 +553,314 @@ def _apply_dynamic_patch_and_reload_weights(model, model_path: str) -> None:
         print("Dynamic patch disabled via QWEN3_DYNAMIC_ENABLED=0")
         return
 
-    dynamic_mode = os.environ.get("QWEN3_DYNAMIC_MODE", "hard_shrink").strip().lower()
-    dynamic_keep_ratio = float(os.environ.get("QWEN3_DYNAMIC_KEEP_RATIO", "0.7"))
-    dynamic_min_keep = int(os.environ.get("QWEN3_DYNAMIC_MIN_KEEP", "32"))
+    local_ckpt = os.path.isdir(model_path)
+
+    patch_impl = os.environ.get("QWEN3_PATCH_IMPL", "dynamic").strip().lower()
+    patch_mod = _load_dynamic_patch_module()
+
+    if patch_impl == "vivid":
+        vivid_cfg = {}
+        state_path = Path(model_path).expanduser() / "distill_state.json"
+        if local_ckpt and state_path.exists():
+            try:
+                with state_path.open("r", encoding="utf-8") as f:
+                    state = json.load(f)
+                vivid_cfg = state.get("vivid", {}) if isinstance(state.get("vivid"), dict) else {}
+            except Exception as e:
+                print(f"Warning: failed to read VIVID distill state from {state_path}: {e}")
+        compact_tokens = int(os.environ.get("QWEN3_VIVID_COMPACT_TOKENS", vivid_cfg.get("compact_tokens", 128)))
+        min_keep_ratio = float(os.environ.get("QWEN3_VIVID_MIN_KEEP_RATIO", vivid_cfg.get("min_keep_ratio", 0.0)))
+        kv_anchors = int(os.environ.get("QWEN3_VIVID_ANCHORS", vivid_cfg.get("anchors", 256)))
+        kv_topk = int(os.environ.get("QWEN3_VIVID_TOPK", vivid_cfg.get("topk", 0)))
+        enable_kv_env = os.environ.get("QWEN3_VIVID_ENABLE_KV")
+        enable_kv = (enable_kv_env != "0") if enable_kv_env is not None else bool(vivid_cfg.get("enable_kv_compression", True))
+        compact_prefill_env = os.environ.get("QWEN3_VIVID_COMPACT_PREFILL")
+        compact_prefill = (compact_prefill_env != "0") if compact_prefill_env is not None else bool(vivid_cfg.get("compact_prefill", True))
+        temperature = float(os.environ.get("QWEN3_VIVID_TEMPERATURE", vivid_cfg.get("temperature", 1.0)))
+        aggregation_mode = os.environ.get("QWEN3_VIVID_AGGREGATION", vivid_cfg.get("aggregation_mode", "uniform"))
+        profile = os.environ.get("QWEN3_VIVID_PROFILE", "0") == "1"
+        stats = patch_mod.apply_vivid_qwen3_native_compact_patch(
+            model,
+            compact_tokens=compact_tokens,
+            min_keep_ratio=min_keep_ratio,
+            kv_anchors=kv_anchors,
+            kv_topk=kv_topk,
+            enable_kv_compression=enable_kv,
+            enable_compact_prefill=compact_prefill,
+            temperature=temperature,
+            aggregation_mode=aggregation_mode,
+            profile=profile,
+            enabled=dynamic_enabled,
+        )
+        vivid_modules = patch_mod.count_vivid_qwen3_native_modules(model)
+        strict = os.environ.get("QWEN3_DYNAMIC_STRICT", "1") != "0"
+        if strict and vivid_modules <= 0:
+            raise RuntimeError("VIVID patch requested but no Qwen3 compact modules were active.")
+
+        model_keys = set(model.state_dict().keys())
+        loaded_keys = 0
+        loaded_vivid_keys = 0
+        vivid_key_markers = ("vivid_compact_aggregator", "assign_norm", "assign_proj", "token_agg_norm", "token_agg_proj")
+        if local_ckpt:
+            for shard_state in _iter_checkpoint_state_dicts(model_path):
+                matched = {k: v for k, v in shard_state.items() if k in model_keys}
+                if matched:
+                    model.load_state_dict(matched, strict=False)
+                    loaded_keys += len(matched)
+                    loaded_vivid_keys += sum(1 for k in matched if any(m in k for m in vivid_key_markers))
+        if strict and state_path.exists() and loaded_vivid_keys == 0:
+            raise RuntimeError(
+                "VIVID checkpoint was provided but no VIVID adapter keys were loaded. "
+                "Ensure checkpoint settings match the VIVID patch."
+            )
+
+        print(
+            f"✓ VIVID native compact patch applied: stats={stats}, modules={vivid_modules}, "
+            f"compact_tokens={compact_tokens}, min_keep_ratio={min_keep_ratio}, kv_anchors={kv_anchors}, kv_topk={kv_topk}, "
+            f"compact_prefill={compact_prefill}, aggregation={aggregation_mode}, loaded_keys={loaded_keys}, loaded_vivid_keys={loaded_vivid_keys}"
+        )
+        return
+
+    if patch_impl == "dymu":
+        dymu_phase = int(os.environ.get("QWEN3_DYMU_PHASE", "1"))
+        dymu_default_threshold = float(os.environ.get("QWEN3_DYMU_DEFAULT_THRESHOLD", "0.8"))
+        dymu_vtu_similarity_threshold = float(os.environ.get("QWEN3_DYMU_VTU_SIM_THRESHOLD", "0.999"))
+        dymu_experimental_vtu = os.environ.get("QWEN3_DYMU_EXPERIMENTAL_VTU", "0") == "1"
+
+        merge_layers_env = os.environ.get("QWEN3_DYMU_MERGE_LAYERS", "").strip()
+        merge_layers = [int(x.strip()) for x in merge_layers_env.split(",") if x.strip()] if merge_layers_env else None
+
+        thresholds = None
+        thresholds_json = os.environ.get("QWEN3_DYMU_THRESHOLDS_JSON", "").strip()
+        if thresholds_json:
+            p = Path(thresholds_json).expanduser()
+            if not p.is_absolute():
+                p = Path(model_path).expanduser().resolve() / p
+            if p.exists():
+                with p.open("r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                thresholds = {int(k): float(v) for k, v in raw.items()}
+
+        cfg_cls = getattr(patch_mod, "DyMUConfig", None)
+        if cfg_cls is None:
+            raise RuntimeError("DyMU patch module is missing DyMUConfig")
+
+        cfg = cfg_cls(
+            phase=dymu_phase,
+            merge_layers=merge_layers,
+            thresholds=thresholds,
+            default_threshold=dymu_default_threshold,
+            vtu_similarity_threshold=dymu_vtu_similarity_threshold,
+            experimental_vtu=dymu_experimental_vtu,
+        )
+        stats = patch_mod.apply_dymu_qwen3_patch(model, cfg)
+        dynamic_blocks = patch_mod.count_dymu_qwen3_merge_layers(model)
+        text_vtu_layers = patch_mod.count_dymu_qwen3_text_vtu_layers(model)
+        strict = os.environ.get("QWEN3_DYNAMIC_STRICT", "1") != "0"
+        if strict and dynamic_blocks <= 0:
+            raise RuntimeError("DyMU patch requested but no Qwen3 vision merge layers were active.")
+
+        model_keys = set(model.state_dict().keys())
+        loaded_keys = 0
+        if local_ckpt:
+            for shard_state in _iter_checkpoint_state_dicts(model_path):
+                matched = {k: v for k, v in shard_state.items() if k in model_keys}
+                if not matched:
+                    continue
+                model.load_state_dict(matched, strict=False)
+                loaded_keys += len(matched)
+        else:
+            print(f"Warning: skipping DyMU checkpoint reload for non-local model: {model_path}")
+
+        print(
+            f"✓ DyMU patch applied: phase={dymu_phase}, stats={stats}, "
+            f"vision_merge_layers={dynamic_blocks}, text_vtu_layers={text_vtu_layers}, loaded_keys={loaded_keys}"
+        )
+        return
+
+    if patch_impl == "diffrate":
+        hard = os.environ.get("QWEN3_DIFFRATE_HARD", "1") != "0"
+
+        compress_layers_env = os.environ.get("QWEN3_DIFFRATE_COMPRESS_LAYERS", "").strip()
+        compress_layers = [int(x.strip()) for x in compress_layers_env.split(",") if x.strip()] if compress_layers_env else None
+
+        cands_env = os.environ.get("QWEN3_DIFFRATE_CANDIDATES", "0.0,0.0625,0.125,0.1875,0.25").strip()
+        candidates = [float(x.strip()) for x in cands_env.split(",") if x.strip()] if cands_env else [0.0, 0.0625, 0.125, 0.1875, 0.25]
+        min_keep = int(os.environ.get("QWEN3_DIFFRATE_MIN_KEEP", "1"))
+
+        cfg_cls = getattr(patch_mod, "DiffRateConfig", None)
+        if cfg_cls is None:
+            raise RuntimeError("DiffRate patch module is missing DiffRateConfig")
+
+        cfg = cfg_cls(
+            compress_layers=compress_layers,
+            candidates=candidates,
+            hard=hard,
+            min_keep_tokens=min_keep,
+        )
+
+        stats = patch_mod.apply_diffrate_qwen3_patch(model, cfg)
+        dynamic_blocks = patch_mod.count_diffrate_qwen3_layers(model)
+        strict = (os.environ.get("QWEN3_DYNAMIC_STRICT", "1") != "0") and local_ckpt
+        if strict and dynamic_blocks <= 0:
+            raise RuntimeError("DiffRate patch requested but no Qwen3 vision compression layers were active.")
+
+        model_keys = set(model.state_dict().keys())
+        loaded_keys = 0
+        loaded_diffrate_keys = 0
+
+        if local_ckpt:
+            for shard_state in _iter_checkpoint_state_dicts(model_path):
+                matched = {k: v for k, v in shard_state.items() if k in model_keys}
+                if not matched:
+                    continue
+                model.load_state_dict(matched, strict=False)
+                loaded_keys += len(matched)
+                loaded_diffrate_keys += sum(1 for k in matched if "diffrate_rate_heads" in k or "_diffrate_rate_heads" in k)
+        else:
+            print(f"Warning: skipping DiffRate checkpoint reload for non-local model: {model_path}")
+
+        if strict and loaded_diffrate_keys == 0:
+            raise RuntimeError(
+                "DiffRate patch applied but no DiffRate rate-head checkpoint keys were loaded. "
+                "Ensure checkpoint matches DiffRate patch settings."
+            )
+
+        schedule = {}
+        try:
+            if hasattr(patch_mod, "export_diffrate_schedule"):
+                schedule = patch_mod.export_diffrate_schedule(model)
+        except Exception:
+            schedule = {}
+        hard_layers = schedule.get("layers", {}) if isinstance(schedule, dict) else {}
+        hard_summary = {
+            str(k): {
+                "p": v.get("hard_prune_rate"),
+                "m": v.get("hard_merge_rate"),
+            }
+            for k, v in hard_layers.items()
+            if isinstance(v, dict)
+        }
+
+        print(
+            f"✓ DiffRate patch applied: stats={stats}, compress_layers={dynamic_blocks}, "
+            f"loaded_keys={loaded_keys}, loaded_diffrate_keys={loaded_diffrate_keys}, "
+            f"hard_mode={hard}, hard_schedule={hard_summary}"
+        )
+        return
+
+    if patch_impl == "visiontrim":
+        trim_layers_env = os.environ.get("QWEN3_VISIONTRIM_TRIM_LAYERS", "").strip()
+        trim_layers = [int(x.strip()) for x in trim_layers_env.split(",") if x.strip()] if trim_layers_env else None
+        keep_ratio = float(os.environ.get("QWEN3_VISIONTRIM_KEEP_RATIO", "0.7"))
+        min_keep = int(os.environ.get("QWEN3_VISIONTRIM_MIN_KEEP", "1"))
+        local_window = int(os.environ.get("QWEN3_VISIONTRIM_LOCAL_WINDOW", "9"))
+        complement_ratio = float(os.environ.get("QWEN3_VISIONTRIM_COMPLEMENT_RATIO", "1.0"))
+
+        cfg_cls = getattr(patch_mod, "VisionTrimConfig", None)
+        if cfg_cls is None:
+            raise RuntimeError("VisionTrim patch module is missing VisionTrimConfig")
+        cfg = cfg_cls(
+            trim_layers=trim_layers,
+            keep_ratio=keep_ratio,
+            min_keep_tokens=min_keep,
+            local_window=local_window,
+            complement_ratio=complement_ratio,
+        )
+        stats = patch_mod.apply_visiontrim_qwen3_patch(model, cfg)
+        trim_layers_count = patch_mod.count_visiontrim_qwen3_layers(model)
+        strict = os.environ.get("QWEN3_DYNAMIC_STRICT", "1") != "0"
+        if strict and trim_layers_count <= 0:
+            raise RuntimeError("VisionTrim patch requested but no Qwen3 vision trim layers were active.")
+
+        model_keys = set(model.state_dict().keys())
+        loaded_keys = 0
+        if local_ckpt:
+            for shard_state in _iter_checkpoint_state_dicts(model_path):
+                matched = {k: v for k, v in shard_state.items() if k in model_keys}
+                if matched:
+                    model.load_state_dict(matched, strict=False)
+                    loaded_keys += len(matched)
+
+        print(
+            f"✓ VisionTrim patch applied: stats={stats}, trim_layers={trim_layers_count}, "
+            f"loaded_keys={loaded_keys}"
+        )
+        return
+
+    if patch_impl in {"zooprune", "zoo_prune", "zoo-prune"}:
+        prune_layers_env = os.environ.get("QWEN3_ZOOPRUNE_PRUNE_LAYERS", "").strip()
+        prune_layers = [int(x.strip()) for x in prune_layers_env.split(",") if x.strip()] if prune_layers_env else None
+        keep_ratio = float(os.environ.get("QWEN3_ZOOPRUNE_KEEP_RATIO", "0.7"))
+        min_keep = int(os.environ.get("QWEN3_ZOOPRUNE_MIN_KEEP", "1"))
+        num_directions = int(os.environ.get("QWEN3_ZOOPRUNE_NUM_DIRECTIONS", "1"))
+        perturb_eps = float(os.environ.get("QWEN3_ZOOPRUNE_PERTURB_EPS", "0.001"))
+        diversity_weight = float(os.environ.get("QWEN3_ZOOPRUNE_DIVERSITY_WEIGHT", "0.25"))
+        merge_dropped = os.environ.get("QWEN3_ZOOPRUNE_MERGE_DROPPED", "0") == "1"
+        max_greedy_tokens = int(os.environ.get("QWEN3_ZOOPRUNE_MAX_GREEDY_TOKENS", "768"))
+
+        cfg_cls = getattr(patch_mod, "ZOOPruneConfig", None)
+        if cfg_cls is None:
+            raise RuntimeError("ZOO-Prune patch module is missing ZOOPruneConfig")
+        cfg = cfg_cls(
+            prune_layers=prune_layers,
+            keep_ratio=keep_ratio,
+            min_keep_tokens=min_keep,
+            num_directions=num_directions,
+            perturb_eps=perturb_eps,
+            diversity_weight=diversity_weight,
+            merge_dropped=merge_dropped,
+            max_greedy_tokens=max_greedy_tokens,
+        )
+        stats = patch_mod.apply_zooprune_qwen3_patch(model, cfg)
+        prune_layers_count = patch_mod.count_zooprune_qwen3_layers(model)
+        strict = os.environ.get("QWEN3_DYNAMIC_STRICT", "1") != "0"
+        if strict and prune_layers_count <= 0:
+            raise RuntimeError("ZOO-Prune patch requested but no Qwen3 vision prune layers were active.")
+
+        model_keys = set(model.state_dict().keys())
+        loaded_keys = 0
+        if local_ckpt:
+            for shard_state in _iter_checkpoint_state_dicts(model_path):
+                matched = {k: v for k, v in shard_state.items() if k in model_keys}
+                if matched:
+                    model.load_state_dict(matched, strict=False)
+                    loaded_keys += len(matched)
+
+        print(
+            f"✓ ZOO-Prune patch applied: stats={stats}, prune_layers={prune_layers_count}, "
+            f"loaded_keys={loaded_keys}"
+        )
+        return
+
+    dynamic_cfg = {}
+    if local_ckpt:
+        state_path = Path(model_path).expanduser() / "distill_state.json"
+        if state_path.exists():
+            try:
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                dynamic_cfg = state.get("dynamic_vision", {}) if isinstance(state.get("dynamic_vision"), dict) else {}
+            except Exception:
+                dynamic_cfg = {}
+
+    dynamic_mode = str(os.environ.get("QWEN3_DYNAMIC_MODE", dynamic_cfg.get("mode", "hard_shrink"))).strip().lower()
+    dynamic_keep_ratio = float(os.environ.get("QWEN3_DYNAMIC_KEEP_RATIO", dynamic_cfg.get("keep_ratio", 0.7)))
+    dynamic_min_keep = int(os.environ.get("QWEN3_DYNAMIC_MIN_KEEP", dynamic_cfg.get("min_keep_tokens", 32)))
 
     stage_ratios_env = os.environ.get("QWEN3_DYNAMIC_STAGE_RATIOS", "").strip()
-    stage_ratios = [float(x.strip()) for x in stage_ratios_env.split(",") if x.strip()] if stage_ratios_env else None
+    if stage_ratios_env:
+        stage_ratios = [float(x.strip()) for x in stage_ratios_env.split(",") if x.strip()]
+    else:
+        cfg_stage_ratios = dynamic_cfg.get("stage_keep_ratios")
+        stage_ratios = [float(x) for x in cfg_stage_ratios] if isinstance(cfg_stage_ratios, list) else None
 
     pruning_locs_env = os.environ.get("QWEN3_DYNAMIC_PRUNING_LOCS", "").strip()
-    pruning_locs = [int(x.strip()) for x in pruning_locs_env.split(",") if x.strip()] if pruning_locs_env else None
+    if pruning_locs_env:
+        pruning_locs = [int(x.strip()) for x in pruning_locs_env.split(",") if x.strip()]
+    else:
+        cfg_pruning_locs = dynamic_cfg.get("pruning_locs")
+        pruning_locs = [int(x) for x in cfg_pruning_locs] if isinstance(cfg_pruning_locs, list) else None
 
-    patch_mod = _load_dynamic_patch_module()
     if dynamic_mode == "hard_shrink":
         patched = patch_mod.apply_dynamic_qwen3_hard_shrink_patch(
             model,
@@ -232,13 +890,16 @@ def _apply_dynamic_patch_and_reload_weights(model, model_path: str) -> None:
     loaded_keys = 0
     loaded_dynamic_keys = 0
 
-    for shard_state in _iter_checkpoint_state_dicts(model_path):
-        matched = {k: v for k, v in shard_state.items() if k in model_keys}
-        if not matched:
-            continue
-        model.load_state_dict(matched, strict=False)
-        loaded_keys += len(matched)
-        loaded_dynamic_keys += sum(1 for k in matched if any(m in k for m in dynamic_key_markers))
+    if local_ckpt:
+        for shard_state in _iter_checkpoint_state_dicts(model_path):
+            matched = {k: v for k, v in shard_state.items() if k in model_keys}
+            if not matched:
+                continue
+            model.load_state_dict(matched, strict=False)
+            loaded_keys += len(matched)
+            loaded_dynamic_keys += sum(1 for k in matched if any(m in k for m in dynamic_key_markers))
+    else:
+        print(f"Warning: skipping dynamic checkpoint reload for non-local model: {model_path}")
 
     if strict and loaded_dynamic_keys == 0:
         raise RuntimeError(
@@ -274,6 +935,10 @@ def _resolve_base_model_path_for_dynamic(checkpoint_path: str) -> str:
                 cp = (b / p).resolve()
                 if cp.exists():
                     return str(cp)
+            # `org/model` Hugging Face ids contain a slash but are not local
+            # paths. Let transformers resolve those instead of failing here.
+            if "\\" not in cand and not cand.startswith(".") and len([x for x in cand.split("/") if x]) >= 2:
+                return cand
             return None
 
         return cand
@@ -384,6 +1049,13 @@ def _prepare_hf_inputs(messages, processor, model_device):
     )
     return {k: v.to(model_device) if hasattr(v, "to") else v for k, v in model_inputs.items()}
 
+
+def _processor_has_chat_template(processor) -> bool:
+    proc_tpl = getattr(processor, "chat_template", None)
+    tok = getattr(processor, "tokenizer", None)
+    tok_tpl = getattr(tok, "chat_template", None) if tok is not None else None
+    return bool(proc_tpl) or bool(tok_tpl)
+
 def run_inference(args):
     """Run inference on the MMMU dataset using Transformers."""
     print("\n" + "="*80)
@@ -432,33 +1104,66 @@ def run_inference(args):
         print(f"   ⚠️  Using sampling decoding (slower but more diverse)")
     print()
 
-    # Load processor for input preparation
-    print(f"Loading processor from {args.model_path}")
-    _sanitize_local_tokenizer_config(args.model_path)
-    _sanitize_local_model_config(args.model_path)
-    processor = AutoProcessor.from_pretrained(
-        args.model_path,
-        trust_remote_code=True,
-        local_files_only=True,
-    )
-    print("✓ Processor loaded\n")
-
     model_load_path = _resolve_base_model_path_for_dynamic(args.model_path)
+
+    # Load processor (prefer checkpoint, fallback to base model path if chat template missing)
+    processor = None
+    processor_load_path = args.model_path
+    print(f"Loading processor from {processor_load_path}")
+    try:
+        _sanitize_local_tokenizer_config(processor_load_path)
+        _sanitize_local_model_config(processor_load_path)
+        processor = AutoProcessor.from_pretrained(
+            processor_load_path,
+            trust_remote_code=True,
+            local_files_only=True,
+        )
+        if not _processor_has_chat_template(processor):
+            print(
+                "Warning: checkpoint processor has no chat template; "
+                f"falling back to base processor: {model_load_path}"
+            )
+            processor = None
+    except Exception as e:
+        print(f"Warning: failed to load processor from checkpoint ({e}); will try base model processor.")
+        processor = None
+
+    if processor is None:
+        processor_load_path = model_load_path
+        _sanitize_local_tokenizer_config(processor_load_path)
+        _sanitize_local_model_config(processor_load_path)
+        processor_load_is_local = Path(processor_load_path).expanduser().exists()
+        processor = AutoProcessor.from_pretrained(
+            processor_load_path,
+            trust_remote_code=True,
+            local_files_only=processor_load_is_local,
+        )
+
+    if not _processor_has_chat_template(processor):
+        raise RuntimeError(
+            "Loaded processor still has no chat template. "
+            "Set QWEN3_BASE_MODEL_PATH to a valid Qwen3-VL-Instruct model path or HF id."
+        )
+
+    print(f"✓ Processor loaded from: {processor_load_path}\n")
+
     _sanitize_local_model_config(model_load_path)
     print(f"Loading model with Transformers from: {model_load_path}")
     model_load_is_local = Path(model_load_path).expanduser().exists()
+    model_dtype = _resolve_model_dtype()
     model = AutoModelForImageTextToText.from_pretrained(
         model_load_path,
         trust_remote_code=True,
         local_files_only=model_load_is_local,
-        dtype=torch.bfloat16,
+        dtype=model_dtype,
         device_map="auto",
     )
     _apply_dynamic_patch_and_reload_weights(model, args.model_path)
     model.eval()
     model_device = next(model.parameters()).device
     print(f"✓ Model loaded on device: {model_device}\n")
-    timers, timer_counts, timer_handles = _install_component_timers(model)
+    timers, timer_counts, token_counters, timer_handles = _install_component_timers(model)
+    visual_mod = getattr(getattr(model, "model", None), "visual", None) or getattr(model, "visual", None)
 
     print("="*80)
     print("🚀 Running Transformers inference")
@@ -489,22 +1194,19 @@ def run_inference(args):
             pre_embed = timers["input_embedding_sec"]
             pre_vision = timers["vision_encoder_sec"]
             pre_proj = timers["projection_sec"]
+            pre_llm_prefill = timers["llm_prefill_sec"]
+            pre_llm_decode = timers["llm_decode_sec"]
+            pre_proj_tokens = token_counters["projection_input_tokens"]
+            pre_patch_tokens = _count_visual_tokens_from_model_inputs(model_inputs)
+            _reset_dynamic_token_counters(visual_mod)
             _sync_if_cuda()
             t_gen0 = time.time()
-            with torch.no_grad():
-                generated = model.generate(
-                    **model_inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=True,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    top_k=args.top_k,
-                    repetition_penalty=args.repetition_penalty,
-                    pad_token_id=processor.tokenizer.eos_token_id,
-                )
+            with torch.inference_mode():
+                generated = model.generate(**model_inputs, **_build_generate_kwargs(args, processor))
             _sync_if_cuda()
             t_gen1 = time.time()
             gen_ids = generated[:, input_len:]
+            output_tokens = int(gen_ids.shape[1])
             response = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
             index = line_dict['index']
 
@@ -517,14 +1219,30 @@ def run_inference(args):
                 "result": {"gen": response_final, "gen_raw": response},
                 "messages": messages
             }
+            projection_tokens = max(0, int(token_counters["projection_input_tokens"] - pre_proj_tokens))
+            alive_tokens = _read_dynamic_alive_tokens(visual_mod)
+            if alive_tokens is None:
+                alive_tokens = projection_tokens
+            llm_prefill_tokens = _read_dynamic_llm_prefill_tokens(model, visual_mod, input_len)
+            _merge_layer_token_stats(
+                token_counters.get("per_layer_timing", {}),
+                _read_dynamic_layer_token_stats(visual_mod),
+                pre_patch_tokens,
+            )
             f.write(json.dumps(result) + '\n')
             num_results += 1
 
             emb_t = max(0.0, timers["input_embedding_sec"] - pre_embed)
             vis_t = max(0.0, timers["vision_encoder_sec"] - pre_vision)
             proj_t = max(0.0, timers["projection_sec"] - pre_proj)
+            llm_prefill_t = max(0.0, timers["llm_prefill_sec"] - pre_llm_prefill)
+            llm_decode_t = max(0.0, timers["llm_decode_sec"] - pre_llm_decode)
             total_t = max(0.0, t_gen1 - t_gen0)
-            dec_t = max(0.0, total_t - emb_t - vis_t - proj_t)
+            residual_llm_t = max(0.0, total_t - emb_t - vis_t - proj_t)
+            dec_t = llm_prefill_t + llm_decode_t
+            if dec_t <= 0.0:
+                llm_decode_t = residual_llm_t
+                dec_t = residual_llm_t
             profile_rows.append(
                 {
                     "index": int(index) if isinstance(index, np.integer) else index,
@@ -532,7 +1250,29 @@ def run_inference(args):
                     "input_embedding_sec": emb_t,
                     "vision_encoder_sec": vis_t,
                     "projection_sec": proj_t,
+                    "llm_prefill_sec": llm_prefill_t,
+                    "llm_decode_sec": llm_decode_t,
                     "llm_decoder_sec": dec_t,
+                    "input_tokens": int(llm_prefill_tokens),
+                    "llm_prefill_tokens": int(llm_prefill_tokens),
+                    "dense_input_tokens": int(input_len),
+                    "output_tokens": int(output_tokens),
+                    "visual_tokens_pre_patch": int(pre_patch_tokens),
+                    "visual_tokens_alive_after_patch": int(alive_tokens),
+                    "visual_tokens_pre_projection": int(projection_tokens),
+                    "visual_token_keep_ratio": (float(alive_tokens) / float(pre_patch_tokens)) if pre_patch_tokens > 0 else 0.0,
+                    "visual_projection_token_ratio": (float(projection_tokens) / float(pre_patch_tokens)) if pre_patch_tokens > 0 else 0.0,
+                    "active_visual_tokens": int(alive_tokens),
+                    "compression_overhead_ms": _read_dynamic_compression_overhead_ms(model, visual_mod),
+                    "kv_cache_gpu_memory_estimated_mb": float(getattr(visual_mod, "_vivid_last_kv_cache_estimated_mb", 0.0) or 0.0),
+                    "encoder_flops_ratio_estimated": float(
+                        getattr(
+                            visual_mod,
+                            "_vivid_last_encoder_flops_ratio_estimated",
+                            ((float(alive_tokens) / float(pre_patch_tokens)) ** 2) if pre_patch_tokens > 0 else 0.0,
+                        )
+                        or 0.0
+                    ),
                 }
             )
 
@@ -551,29 +1291,72 @@ def run_inference(args):
             agg_embed = float(sum(x["input_embedding_sec"] for x in profile_rows))
             agg_vision = float(sum(x["vision_encoder_sec"] for x in profile_rows))
             agg_proj = float(sum(x["projection_sec"] for x in profile_rows))
+            agg_prefill = float(sum(x.get("llm_prefill_sec", 0.0) for x in profile_rows))
+            agg_decode = float(sum(x.get("llm_decode_sec", 0.0) for x in profile_rows))
             agg_dec = float(sum(x["llm_decoder_sec"] for x in profile_rows))
+            agg_input_tokens = int(sum(int(x.get("input_tokens", 0)) for x in profile_rows))
+            agg_out_tokens = int(sum(int(x.get("output_tokens", 0)) for x in profile_rows))
+            agg_tokens_pre = int(sum(x["visual_tokens_pre_patch"] for x in profile_rows))
+            agg_tokens_alive = int(sum(x.get("visual_tokens_alive_after_patch", x["visual_tokens_pre_projection"]) for x in profile_rows))
+            agg_tokens_post = int(sum(x["visual_tokens_pre_projection"] for x in profile_rows))
+            agg_compression_ms = float(sum(float(x.get("compression_overhead_ms", 0.0) or 0.0) for x in profile_rows))
+            agg_kv_cache_mb = float(sum(float(x.get("kv_cache_gpu_memory_estimated_mb", 0.0) or 0.0) for x in profile_rows) / len(profile_rows))
+            agg_flops_ratio = float(sum(float(x.get("encoder_flops_ratio_estimated", 0.0) or 0.0) for x in profile_rows) / len(profile_rows))
         else:
-            agg_total = agg_embed = agg_vision = agg_proj = agg_dec = 0.0
+            agg_total = agg_embed = agg_vision = agg_proj = agg_prefill = agg_decode = agg_dec = 0.0
+            agg_input_tokens = 0
+            agg_out_tokens = 0
+            agg_tokens_pre = agg_tokens_alive = agg_tokens_post = 0
+            agg_compression_ms = agg_kv_cache_mb = agg_flops_ratio = 0.0
 
         timing_payload = {
             "model_path": args.model_path,
             "dataset": args.dataset,
             "num_samples": num_results,
+            "compression_overhead_source": "measured_patch_runtime",
             "total": {
                 "generate_total_sec": agg_total,
                 "input_embedding_sec": agg_embed,
                 "vision_encoder_sec": agg_vision,
                 "projection_sec": agg_proj,
+                "llm_prefill_sec": agg_prefill,
+                "llm_decode_sec": agg_decode,
                 "llm_decoder_sec": agg_dec,
+                "input_tokens": agg_input_tokens,
+                "llm_prefill_tokens": agg_input_tokens,
+                "output_tokens": agg_out_tokens,
+                "visual_tokens_pre_patch": agg_tokens_pre,
+                "visual_tokens_alive_after_patch": agg_tokens_alive,
+                "visual_tokens_pre_projection": agg_tokens_post,
+                "visual_token_keep_ratio": (float(agg_tokens_alive) / float(agg_tokens_pre)) if agg_tokens_pre > 0 else 0.0,
+                "visual_projection_token_ratio": (float(agg_tokens_post) / float(agg_tokens_pre)) if agg_tokens_pre > 0 else 0.0,
+                "compression_overhead_ms": agg_compression_ms,
+                "kv_cache_gpu_memory_estimated_mb": agg_kv_cache_mb,
+                "encoder_flops_ratio_estimated": agg_flops_ratio,
             },
             "avg_per_sample": {
                 "generate_total_sec": (agg_total / num_results) if num_results else 0.0,
                 "input_embedding_sec": (agg_embed / num_results) if num_results else 0.0,
                 "vision_encoder_sec": (agg_vision / num_results) if num_results else 0.0,
                 "projection_sec": (agg_proj / num_results) if num_results else 0.0,
+                "llm_prefill_sec": (agg_prefill / num_results) if num_results else 0.0,
+                "llm_decode_sec": (agg_decode / num_results) if num_results else 0.0,
                 "llm_decoder_sec": (agg_dec / num_results) if num_results else 0.0,
+                "input_tokens": (float(agg_input_tokens) / num_results) if num_results else 0.0,
+                "llm_prefill_tokens": (float(agg_input_tokens) / num_results) if num_results else 0.0,
+                "output_tokens": (float(agg_out_tokens) / num_results) if num_results else 0.0,
+                "visual_tokens_pre_patch": (float(agg_tokens_pre) / num_results) if num_results else 0.0,
+                "visual_tokens_alive_after_patch": (float(agg_tokens_alive) / num_results) if num_results else 0.0,
+                "visual_tokens_pre_projection": (float(agg_tokens_post) / num_results) if num_results else 0.0,
+                "visual_token_keep_ratio": (float(agg_tokens_alive) / float(agg_tokens_pre)) if agg_tokens_pre > 0 else 0.0,
+                "visual_projection_token_ratio": (float(agg_tokens_post) / float(agg_tokens_pre)) if agg_tokens_pre > 0 else 0.0,
+                "compression_overhead_ms": (agg_compression_ms / len(profile_rows)) if len(profile_rows) else 0.0,
+                "kv_cache_gpu_memory_estimated_mb": agg_kv_cache_mb,
+                "encoder_flops_ratio_estimated": agg_flops_ratio,
             },
             "calls": timer_counts,
+            "token_calls": token_counters,
+            "per_layer": token_counters.get("per_layer_timing", {}),
             "per_sample": profile_rows,
         }
         with open(args.profile_output, "w", encoding="utf-8") as pf:
@@ -588,11 +1371,27 @@ def run_evaluation(args):
     with open(args.input_file, 'r') as f:
         for line in f:
             job = json.loads(line)
-            annotation = job["annotation"]
+            annotation = dict(job.get("annotation", {}))
+            if "index" not in annotation and "Index" in annotation:
+                annotation["index"] = annotation["Index"]
+            elif "index" not in annotation and "question_id" in annotation:
+                annotation["index"] = annotation["question_id"]
+            elif "index" not in annotation and "question_id" in job:
+                annotation["index"] = job["question_id"]
             annotation["prediction"] = job["result"]["gen"]
             results.append(annotation)
             
     data = pd.DataFrame.from_records(results)
+    if "index" not in data.columns:
+        col_map = {str(c).lower(): c for c in data.columns}
+        for cand in ("index", "question_id", "qid"):
+            if cand in col_map:
+                data["index"] = data[col_map[cand]]
+                break
+    if "index" not in data.columns:
+        raise ValueError(
+            f"Missing 'index' in eval input records. Available columns: {list(data.columns)}"
+        )
     data = data.sort_values(by='index')
     data['prediction'] = [str(x) for x in data['prediction']]
     # If not choice label, then use lower case
@@ -752,7 +1551,10 @@ def main():
                             help="API type for evaluation")
     eval_parser.add_argument("--nproc", type=int, default=4, help="Number of processes to use")
     
-    args = parser.parse_args()
+    try:
+        args = parser.parse_args()
+    except SystemExit as exc:
+        return int(exc.code) if isinstance(exc.code, int) else 2
     
     os.environ['LMUData'] = args.data_dir
     
@@ -761,12 +1563,20 @@ def main():
         args.tensor_parallel_size = torch.cuda.device_count()
         print(f"Auto-set tensor_parallel_size to {args.tensor_parallel_size}")
     
-    if args.command == 'infer':
-        run_inference(args)
-    elif args.command == 'eval':
-        run_evaluation(args)
-    else:
-        parser.print_help()
+    try:
+        if args.command == 'infer':
+            run_inference(args)
+        elif args.command == 'eval':
+            run_evaluation(args)
+        else:
+            parser.print_help()
+            return 2
+    except Exception as e:
+        cmd = args.command or 'command'
+        print(f"Error during {cmd}: {e}")
+        return 2
+
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

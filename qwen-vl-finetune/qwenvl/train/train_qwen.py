@@ -25,15 +25,21 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-# Ensure Qwen3-VL root is importable for VIVID helpers.
+# Ensure external VIVID-Qwen3VL method package is importable.
 qwen_root = Path(__file__).resolve().parents[3]
 if str(qwen_root) not in sys.path:
     sys.path.insert(0, str(qwen_root))
+vivid_root = qwen_root.parent / "VIVID-Qwen3VL"
+if str(vivid_root) not in sys.path:
+    sys.path.insert(0, str(vivid_root))
 
 from trainer import replace_qwen2_vl_attention_class
-from vivid.qwen3_patch import (
+from qwen3_vivid_patch import (
+    apply_vivid_qwen3_native_compact_patch,
     apply_vivid_qwen3_vision_patch,
+    count_vivid_qwen3_native_modules,
     count_vivid_qwen3_blocks,
+    is_vivid_qwen3_native_patched,
     is_vivid_qwen3_vision_patched,
 )
 
@@ -147,24 +153,48 @@ def train(attn_implementation="flash_attention_2"):
 
     if data_args.model_type == "qwen3vl":
         vivid_enabled = os.environ.get("QWEN3_VIVID_ENABLED", "1") != "0"
+        vivid_native = os.environ.get("QWEN3_VIVID_NATIVE", "1") != "0"
+        vivid_compact_tokens = int(os.environ.get("QWEN3_VIVID_COMPACT_TOKENS", "128"))
+        vivid_min_keep_ratio = float(os.environ.get("QWEN3_VIVID_MIN_KEEP_RATIO", "0.0"))
         vivid_anchors = int(os.environ.get("QWEN3_VIVID_ANCHORS", "256"))
-        vivid_topk = int(os.environ.get("QWEN3_VIVID_TOPK", "8"))
-        patched = apply_vivid_qwen3_vision_patch(
-            model,
-            num_anchors=vivid_anchors,
-            topk=vivid_topk,
-            enabled=vivid_enabled,
-        )
-        vivid_blocks = count_vivid_qwen3_blocks(model)
+        vivid_topk = int(os.environ.get("QWEN3_VIVID_TOPK", "0"))
+        vivid_enable_kv = os.environ.get("QWEN3_VIVID_ENABLE_KV", "1") != "0"
+        vivid_aggregation = os.environ.get("QWEN3_VIVID_AGGREGATION", "learned")
+        vivid_profile = os.environ.get("QWEN3_VIVID_PROFILE", "0") == "1"
+        if vivid_native:
+            patched = apply_vivid_qwen3_native_compact_patch(
+                model,
+                compact_tokens=vivid_compact_tokens,
+                min_keep_ratio=vivid_min_keep_ratio,
+                kv_anchors=vivid_anchors,
+                kv_topk=vivid_topk,
+                enable_kv_compression=vivid_enable_kv,
+                aggregation_mode=vivid_aggregation,
+                profile=vivid_profile,
+                enabled=vivid_enabled,
+            )
+            vivid_blocks = count_vivid_qwen3_native_modules(model)
+            vivid_is_patched = is_vivid_qwen3_native_patched(model)
+        else:
+            patched = apply_vivid_qwen3_vision_patch(
+                model,
+                num_anchors=vivid_anchors,
+                topk=vivid_topk,
+                enabled=vivid_enabled,
+            )
+            vivid_blocks = count_vivid_qwen3_blocks(model)
+            vivid_is_patched = is_vivid_qwen3_vision_patched(model)
         strict = os.environ.get("QWEN3_VIVID_STRICT", "1") != "0"
-        if vivid_enabled and strict and not is_vivid_qwen3_vision_patched(model):
+        if vivid_enabled and strict and not vivid_is_patched:
             raise RuntimeError(
-                "VIVID patch requested but not applied: no Qwen3 vision block uses Qwen3VIVIDVisionAttention."
+                "VIVID patch requested but not applied to Qwen3-VL."
             )
 
-        if patched > 0 or vivid_blocks > 0:
+        if patched or vivid_blocks > 0:
             rank0_print(
-                f"VIVID Qwen3 vision status: patched_now={patched}, vivid_blocks={vivid_blocks}, anchors={vivid_anchors}, topk={vivid_topk}, enabled={vivid_enabled}"
+                f"VIVID Qwen3 status: native={vivid_native}, patched_now={patched}, vivid_modules={vivid_blocks}, "
+                f"compact_tokens={vivid_compact_tokens}, min_keep_ratio={vivid_min_keep_ratio}, anchors={vivid_anchors}, topk={vivid_topk}, "
+                f"kv={vivid_enable_kv}, aggregation={vivid_aggregation}, enabled={vivid_enabled}"
             )
 
     processor = AutoProcessor.from_pretrained(

@@ -35,7 +35,10 @@ def decode_base64_to_image_file(base64_string, output_path):
 
 def download_file(url, local_path):
     """Download a file from a URL to a local path."""
-    response = requests.get(url, stream=True)
+    insecure = os.environ.get("REALWORLDQA_INSECURE_DOWNLOAD", "0") == "1"
+    if insecure:
+        print("Warning: REALWORLDQA_INSECURE_DOWNLOAD=1 (SSL verification disabled).")
+    response = requests.get(url, stream=True, verify=not insecure)
     response.raise_for_status()
     
     with open(local_path, 'wb') as f:

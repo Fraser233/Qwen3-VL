@@ -4,6 +4,7 @@ import time
 import random
 import copy
 import traceback
+import re
 import pandas as pd
 from PIL import Image
 from typing import List, Dict, Tuple, Any
@@ -178,6 +179,56 @@ def can_infer(answer, choices):
     return copt if copt else can_infer_text(answer, choices)
 
 
+def _strip_answer_text(text: str) -> str:
+    text = str(text).strip()
+    text = text.strip(' \t\n\r.:;,$')
+    if text.startswith('$') and text.endswith('$') and len(text) > 1:
+        text = text[1:-1].strip()
+    return text.strip(' \t\n\r.:;,$')
+
+
+def can_infer_open_answer(answer):
+    """Rule-based extraction for MathVision open-ended answers."""
+    if isinstance(answer, bool) or answer is None:
+        return False
+    text = str(answer)
+    if not text.strip() or FAIL_MSG in text:
+        return False
+
+    boxed = re.findall(r'\\boxed\s*\{([^{}]+)\}', text)
+    if boxed:
+        return _strip_answer_text(boxed[-1])
+
+    patterns = (
+        r'(?:the\s+)?final\s+answer\s+is\s*[:：]?\s*([^\n\.]+)',
+        r'(?:the\s+)?correct\s+answer\s+is\s*[:：]?\s*([^\n\.]+)',
+        r'(?:the\s+)?answer\s+is\s*[:：]?\s*([^\n\.]+)',
+        r'extracted\s+answer\s*[:：]\s*([^\n\.]+)',
+    )
+    for pattern in patterns:
+        matches = re.findall(pattern, text, flags=re.IGNORECASE)
+        if matches:
+            cand = _strip_answer_text(matches[-1])
+            cand = re.sub(r'^(?:option|choice)\s+', '', cand, flags=re.IGNORECASE).strip()
+            option = re.match(r'^\(?([A-Z])\)?$', cand, flags=re.IGNORECASE)
+            if option:
+                return option.group(1).upper()
+            number = re.search(r'-?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?', cand)
+            return number.group(0) if number else cand
+
+    # As a last rule-only fallback, use the last standalone number or option on
+    # the final non-empty line. This avoids matching every number in reasoning.
+    lines = [x.strip() for x in text.splitlines() if x.strip()]
+    for line in reversed(lines[-3:]):
+        option = re.search(r'(?:^|\b)([A-E])(?:\b|$)', line)
+        if option and re.search(r'answer|option|choice|therefore|thus|so', line, flags=re.IGNORECASE):
+            return option.group(1).upper()
+        nums = re.findall(r'-?\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?', line)
+        if nums and re.search(r'answer|therefore|thus|so|result|is', line, flags=re.IGNORECASE):
+            return nums[-1]
+    return False
+
+
 def post_check(line, prefetch=False):
     """Check if the prediction matches the answer."""
     res = None
@@ -191,7 +242,7 @@ def post_check(line, prefetch=False):
             if prefetch:
                 return res
         else:
-            res = str(response)
+            res = can_infer_open_answer(response) if prefetch else str(response)
             ans = str(ans)
     except ValueError:
         pass
